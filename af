@@ -1,500 +1,656 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# AF Termux (ADB Fastboot Termux)
+# AF Termux (ADB Fastboot Termux) v1.1.0
 # By lptech22 — https://github.com/lptech22/af-termux
-# Toolkit ini tidak melakukan flash atau erase partisi.
+# Flash partisi HANYA di modul Advanced (konfirmasi ganda). Tidak ada erase.
 
-AF_VERSION="1.0.0"
+AF_VERSION="1.1.0"
 AF_REPO="lptech22/af-termux"
 AF_RAW="https://raw.githubusercontent.com/$AF_REPO/main"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 
-GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; CYAN="\033[36m"; BOLD="\033[1m"; RESET="\033[0m"
+GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; CYAN="\033[36m"; BOLD="\033[1m"; DIM="\033[2m"; RESET="\033[0m"
 
 # ---------- backend ----------
 if command -v termux-adb >/dev/null 2>&1; then ADB="termux-adb"; elif command -v adb >/dev/null 2>&1; then ADB="adb"; else ADB=""; fi
 if command -v termux-fastboot >/dev/null 2>&1; then FB="termux-fastboot"; elif command -v fastboot >/dev/null 2>&1; then FB="fastboot"; else FB=""; fi
 
-# ---------- helper ----------
-pause()   { echo; read -r -p "Tekan Enter untuk lanjut..." _; }
-confirm() { local c; read -r -p "$1 [y/N]: " c; [[ "$c" =~ ^[Yy]$ ]]; }
-expand()  { local p="$1"; echo "${p/#\~/$HOME}"; }
-ok()      { echo -e "${GREEN}$*${RESET}"; }
-warn()    { echo -e "${YELLOW}$*${RESET}"; }
-err()     { echo -e "${RED}$*${RESET}"; }
+MODE=""; SERIAL=""
+trap 'echo; err "Dibatalkan."; exit 130' INT
 
-need_adb() {
-  if [ -z "$ADB" ]; then err "Backend ADB tidak ditemukan. Jalankan ulang installer."; return 1; fi
+# ---------- helper ----------
+ask()     { read -r "$@" || { echo; err "Input ditutup."; exit 0; }; }
+pause()   { echo; ask -p "Tekan Enter untuk lanjut..." _; }
+confirm() { local c; ask -p "$1 [y/N]: " c; [[ "$c" =~ ^[Yy]$ ]]; }
+expand()  { local p="$1"; echo "${p/#\~/$HOME}"; }
+ok()      { echo -e "${GREEN}✔${RESET} $*"; }
+warn()    { echo -e "${YELLOW}⚠${RESET} $*"; }
+err()     { echo -e "${RED}✖${RESET} $*"; }
+hr()      { echo -e "${DIM}────────────────────────────────────────────${RESET}"; }
+need_adb() { [ -n "$ADB" ] || { err "Backend ADB tidak ada. Jalankan ulang installer."; return 1; }; }
+need_fb()  { [ -n "$FB" ]  || { err "Backend Fastboot tidak ada. Jalankan ulang installer."; return 1; }; }
+outdir()   { local d; if [ -d "$HOME/storage/shared" ]; then d="$HOME/storage/shared/AF"; else d="$HOME/af-output"; fi; mkdir -p "$d" 2>/dev/null && echo "$d"; }
+stamp()    { date +%Y%m%d-%H%M%S; }
+
+# ---------- deteksi mode (refresh tiap layar digambar) ----------
+detect_mode() {
+  MODE=""; SERIAL=""
+  if [ -n "$FB" ] && [ -n "$($FB devices 2>/dev/null | grep .)" ]; then MODE="fastboot"; return 0; fi
+  [ -n "$ADB" ] || return 0
+  local line st
+  line=$($ADB devices 2>/dev/null | awk 'NR>1 && NF>1 {print $1" "$2}' | head -1)
+  st=${line#* }; SERIAL=${line%% *}
+  case "$st" in
+    device)       MODE="adb" ;;
+    sideload)     MODE="sideload" ;;
+    recovery)     MODE="recovery" ;;
+    unauthorized) MODE="unauthorized" ;;
+    offline)      MODE="offline" ;;
+    *)            SERIAL="" ;;
+  esac
 }
-need_fb() {
-  if [ -z "$FB" ]; then err "Backend Fastboot tidak ditemukan. Jalankan ulang installer."; return 1; fi
+
+badge() {
+  case "$MODE" in
+    adb)          echo -e "${GREEN}● ADB terhubung${RESET}" ;;
+    recovery)     echo -e "${CYAN}● Recovery (via ADB)${RESET}" ;;
+    sideload)     echo -e "${CYAN}● Sideload${RESET}" ;;
+    fastboot)     echo -e "${YELLOW}● Fastboot${RESET}" ;;
+    unauthorized) echo -e "${RED}● ADB — setujui dialog izin${RESET}" ;;
+    offline)      echo -e "${RED}● ADB — offline${RESET}" ;;
+    *)            echo -e "${RED}○ Tidak ada perangkat${RESET}" ;;
+  esac
 }
+
+banner() {
+  clear
+  echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+  echo -e " ${BOLD}AF TERMUX${RESET} ${YELLOW}v$AF_VERSION${RESET} ${DIM}· ADB & Fastboot · lptech22${RESET}"
+  echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+  detect_mode
+  echo -e " Mode: $(badge)"
+  if [ "$MODE" = adb ]; then
+    local m; m=$($ADB shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+    [ -n "$m" ] && echo -e " ${DIM}Unit: $m${RESET}"
+  fi
+  echo
+  [ -n "$1" ] && { echo -e "${BOLD}▶ $1${RESET}"; echo; }
+}
+
 adb_ready() {
   need_adb || return 1
-  local st
-  st=$($ADB get-state 2>&1 | tr -d '\r' | head -1)
-  if [ "$st" != "device" ]; then
-    err "Perangkat ADB belum siap (${st:-tidak terdeteksi})."
-    warn "Cek kabel/OTG, aktifkan USB debugging, dan setujui dialog di perangkat target."
-    return 1
-  fi
+  local i devs n
+  for i in 1 2 3; do
+    devs=$($ADB devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1}')
+    n=$(printf '%s\n' "$devs" | grep -c . || true)
+    if [ "$n" -eq 1 ]; then return 0; fi
+    if [ "$n" -gt 1 ]; then err "Ada $n perangkat ADB. Cabut salah satu."; return 1; fi
+    [ "$i" -eq 3 ] && break
+    warn "Belum siap (percobaan $i/3). Setujui dialog 'Izinkan debugging USB'"
+    warn "dan/atau izin USB untuk Termux bila muncul di layar."
+    ask -p "Enter = cek ulang (Ctrl+C batal)... " _ || return 1
+  done
+  err "Perangkat ADB belum siap. Coba Koneksi > Diagnosis USB."
+  return 1
 }
 
-outdir() {
-  local d
-  if [ -d "$HOME/storage/shared" ]; then d="$HOME/storage/shared/AF"; else d="$HOME/af-output"; fi
-  mkdir -p "$d" && echo "$d"
-}
-stamp() { date +%Y%m%d-%H%M%S; }
-
-header() {
-  clear
-  echo -e "${CYAN}${BOLD}AF TERMUX${RESET} ${YELLOW}v${AF_VERSION}${RESET}  ·  ADB & Fastboot  ·  by lptech22"
-  echo "--------------------------------------------------"
-  [ -n "$1" ] && { echo -e "${BOLD}$1${RESET}"; echo; }
-}
-
-usage() {
-  cat <<EOF
-AF Termux v$AF_VERSION — ADB & Fastboot lewat Termux
-By lptech22
-
-Pemakaian:
-  af              Buka menu
-  af --version    Tampilkan versi
-  af --help       Tampilkan bantuan ini
-  af update       Perbarui toolkit
-  af uninstall    Hapus toolkit
-EOF
+wait_mode() { # wait_mode <mode> <timeout-detik>
+  local want="$1" t="${2:-60}" i
+  for ((i=0; i<t; i++)); do
+    detect_mode
+    [ "$MODE" = "$want" ] && return 0
+    sleep 1; printf "."
+  done
+  echo; return 1
 }
 
 # ---------- 1. Perangkat ----------
-check_adb() {
-  need_adb || return
-  echo "Mengecek perangkat ADB..."
-  $ADB devices -l
-  echo
-  echo "Status 'unauthorized' = setujui dialog USB debugging di perangkat target."
-}
-
-check_fastboot() {
-  need_fb || return
-  echo "Mengecek perangkat Fastboot..."
-  local out
-  out=$($FB devices 2>&1)
-  if [ -z "$out" ]; then
-    warn "Tidak ada perangkat Fastboot terdeteksi."
-    echo "Pastikan target berada di mode bootloader/fastboot."
-  else
-    echo "$out"
-  fi
-}
-
 info_adb() {
   adb_ready || return
-  local pair label prop val bat
-  for pair in "Merk:ro.product.manufacturer" "Model:ro.product.model" "Perangkat:ro.product.device" \
-              "Android:ro.build.version.release" "SDK:ro.build.version.sdk" \
-              "Build:ro.build.display.id" "ABI:ro.product.cpu.abi" \
-              "Patch keamanan:ro.build.version.security_patch"; do
-    label=${pair%%:*}; prop=${pair#*:}
-    val=$($ADB shell getprop "$prop" 2>/dev/null | tr -d '\r')
-    printf "%-16s %s\n" "$label" "${val:--}"
-  done
-  printf "%-16s %s\n" "Serial" "$($ADB get-serialno 2>/dev/null | tr -d '\r')"
-  bat=$($ADB shell dumpsys battery 2>/dev/null | tr -d '\r' | awk '/level:/{print $2}')
-  printf "%-16s %s\n" "Baterai" "${bat:--}%"
+  local kv mem sto scr bat lvl stt s
+  kv() { printf " ${BOLD}%-12s${RESET} %s\n" "$1" "$2"; }
+  kv "Merk/Model" "$($ADB shell getprop ro.product.manufacturer 2>/dev/null | tr -d '\r') $($ADB shell getprop ro.product.model 2>/dev/null | tr -d '\r')"
+  kv "Perangkat"   "$($ADB shell getprop ro.product.device 2>/dev/null | tr -d '\r')"
+  kv "Android"     "$($ADB shell getprop ro.build.version.release 2>/dev/null | tr -d '\r') (SDK $($ADB shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r'))"
+  kv "Build"       "$($ADB shell getprop ro.build.display.id 2>/dev/null | tr -d '\r')"
+  kv "ABI"         "$($ADB shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
+  kv "Patch"       "$($ADB shell getprop ro.build.version.security_patch 2>/dev/null | tr -d '\r')"
+  mem=$($ADB shell cat /proc/meminfo 2>/dev/null | awk '/MemTotal/{printf "%.1f GB", $2/1048576}')
+  sto=$($ADB shell df -h /data 2>/dev/null | awk 'NR==2{print $4" bebas / "$2}')
+  scr=$($ADB shell wm size 2>/dev/null | tr -d '\r' | awk '{print $3}')
+  bat=$($ADB shell dumpsys battery 2>/dev/null | tr -d '\r')
+  lvl=$(awk '/level:/{print $2}' <<<"$bat")
+  stt=$(awk '/status:/{print $2}' <<<"$bat")
+  case "$stt" in 2) s="mengisi daya";; 5) s="penuh";; 3) s="tidak mengisi";; *) s="-";; esac
+  kv "RAM" "${mem:--}"; kv "Storage" "${sto:--}"; kv "Layar" "${scr:--}"
+  kv "Baterai" "${lvl:--}% ($s)"
+  kv "Serial" "$SERIAL"
+  hr
+  echo -e " ${DIM}Tip: cek mode lain via menu Reboot. Fastboot terbatas info.${RESET}"
 }
 
 info_fastboot() {
   need_fb || return
-  if [ -z "$($FB devices 2>&1)" ]; then
-    warn "Tidak ada perangkat Fastboot terdeteksi."; return
-  fi
+  detect_mode; [ "$MODE" = fastboot ] || { warn "Tidak ada perangkat Fastboot (masuk mode bootloader dulu)."; return; }
   local v line
   for v in product serialno current-slot unlocked secure version-bootloader; do
-    line=$($FB getvar "$v" 2>&1 | tr -d '\r' | grep -m1 "^$v:")
-    printf "%-20s %s\n" "$v" "${line#*: }"
+    line=$($FB getvar "$v" 2>&1 | tr -d '\r' | sed 's/^[[:space:]]*(bootloader)[[:space:]]*//' | grep -m1 "^$v:")
+    printf " ${BOLD}%-18s${RESET} %s\n" "$v" "${line#*: }"
   done
+}
+
+list_partisi() {
+  adb_ready || return
+  echo "Partisi (by-name):"
+  $ADB shell "ls -l /dev/block/by-name/ 2>/dev/null || ls -l /dev/block/bootdevice/by-name/ 2>/dev/null" | tr -d '\r' | head -60
+  warn "Kosong = skema by-name tidak tersedia di perangkat ini."
 }
 
 menu_perangkat() {
   while true; do
-    header "Perangkat"
-    echo " 1) Cek perangkat ADB"
-    echo " 2) Cek perangkat Fastboot"
-    echo " 3) Info perangkat (ADB)"
-    echo " 4) Info perangkat (Fastboot)"
+    banner "Perangkat"
+    echo " 1) Info lengkap (ADB)"
+    echo " 2) Info (Fastboot)"
+    echo " 3) Daftar partisi (ADB)"
+    echo " R) Refresh deteksi"
     echo " 0) Kembali"
     echo
-    read -r -p "Pilih: " c; echo
+    ask -p "Pilih: " c
     case "$c" in
-      1) check_adb; pause ;;
-      2) check_fastboot; pause ;;
-      3) info_adb; pause ;;
-      4) info_fastboot; pause ;;
+      1) info_adb; pause ;;
+      2) info_fastboot; pause ;;
+      3) list_partisi; pause ;;
+      r|R) ok "Status diperbarui." ;;
       0) return ;;
       *) err "Pilihan tidak valid."; sleep 1 ;;
     esac
   done
 }
 
-# ---------- 2. File & Aplikasi ----------
-copy_files() {
-  need_adb || return
-  echo "1) Kirim file ke perangkat (push)"
-  echo "2) Ambil file dari perangkat (pull)"
-  read -r -p "Pilih [1/2]: " m
-  local src dst
-  case "$m" in
-    1)
-      read -r -e -p "Path file/folder lokal: " src; src=$(expand "$src")
-      read -r -e -p "Tujuan di perangkat (mis. /sdcard/Download/): " dst
-      [ -e "$src" ] || { err "File lokal tidak ditemukan."; return; }
-      $ADB push "$src" "$dst"
-      ;;
-    2)
-      read -r -e -p "Path di perangkat (mis. /sdcard/DCIM/foto.jpg): " src
-      read -r -e -p "Tujuan lokal [$PWD]: " dst
-      dst=$(expand "${dst:-$PWD}")
-      $ADB pull "$src" "$dst"
-      ;;
-    *) echo "Pilihan tidak valid." ;;
-  esac
+# ---------- file picker (tanpa ketik path) ----------
+pick_local() { # $1=start, $2=file|folder → hasil: LSEL
+  local dir="${1:-$PWD}" mode="${2:-file}" c sel n hint
+  while true; do
+    [ -d "$dir" ] || dir="$HOME"
+    local items=() ; n=1
+    echo; echo -e "${BOLD}📁 Lokal:${RESET} $dir"
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      items+=("$f"); printf " %2d) %s\n" "$n" "$f"; n=$((n+1))
+    done < <(ls -1Ap "$dir" 2>/dev/null | head -200)
+    [ "${#items[@]}" -eq 0 ] && warn "(folder kosong)"
+    hint=" 0) ../ naik   k) ketik path   q) batal"
+    [ "$mode" = folder ] && hint="$hint   ${GREEN}p) pakai folder ini${RESET}"
+    echo -e "$hint"
+    ask -p "Pilih: " c
+    case "$c" in
+      0) dir=$(dirname "$dir") ;;
+      q|Q) return 1 ;;
+      k|K) ask -e -p "Path: " dir; dir=$(expand "$dir") ;;
+      p|P) [ "$mode" = folder ] && { LSEL="$dir"; return 0; } ;;
+      *)
+        if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "${#items[@]}" ]; then
+          sel="${items[$((c-1))]}"
+          case "$sel" in
+            */) dir="${dir%/}/${sel%/}" ;;
+            *)  LSEL="${dir%/}/$sel"; return 0 ;;
+          esac
+        else err "Pilihan tidak valid."; fi
+        ;;
+    esac
+  done
 }
 
-install_apk() {
+pick_remote() { # $1=start, $2=file|folder → hasil: RSEL
+  local dir="${1:-/sdcard}" mode="${2:-file}" c sel n hint it
+  while true; do
+    adb_ready || return 1
+    local items=() ; n=1
+    echo; echo -e "${BOLD}📱 Perangkat:${RESET} $dir"
+    mapfile -t items < <($ADB shell "ls -1p '$dir'" 2>/dev/null | tr -d '\r' | sed '/^$/d' | head -200)
+    if [ "${#items[@]}" -eq 0 ]; then warn "(kosong / tidak terbaca)"; fi
+    for it in "${items[@]}"; do printf " %2d) %s\n" "$n" "$it"; n=$((n+1)); done
+    hint=" 0) ../ naik   k) ketik path   q) batal"
+    [ "$mode" = folder ] && hint="$hint   ${GREEN}p) pakai folder ini${RESET}"
+    echo -e "$hint"
+    ask -p "Pilih: " c
+    case "$c" in
+      0) dir=$(dirname "$dir") ;;
+      q|Q) return 1 ;;
+      k|K) ask -e -p "Path di perangkat: " dir ;;
+      p|P) [ "$mode" = folder ] && { RSEL="$dir"; return 0; } ;;
+      *)
+        if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "${#items[@]}" ]; then
+          sel="${items[$((c-1))]}"
+          case "$sel" in
+            */) dir="${dir%/}/${sel%/}" ;;
+            *)  RSEL="${dir%/}/$sel"; return 0 ;;
+          esac
+        else err "Pilihan tidak valid."; fi
+        ;;
+    esac
+  done
+}
+
+dl_dir() { local d="$HOME/storage/shared/Download"; [ -d "$d" ] && echo "$d" || echo "$PWD"; }
+
+# ---------- 2. File & APK ----------
+do_push() {
+  need_adb || return
+  local base="$HOME/storage/shared"; [ -d "$base" ] || base="$HOME"
+  pick_local "$base" file || { warn "Batal."; return; }
+  local src="$LSEL"
+  pick_remote "/sdcard/" folder || { warn "Batal."; return; }
+  $ADB push "$src" "$RSEL"
+}
+
+do_pull() {
+  need_adb || return
+  pick_remote "/sdcard" file || { warn "Batal."; return; }
+  local src="$RSEL"
+  pick_local "$(dl_dir)" folder || { warn "Batal."; return; }
+  $ADB pull "$src" "$LSEL"
+}
+
+do_install_apk() {
   adb_ready || return
-  local apk
-  read -r -e -p "Path file APK: " apk; apk=$(expand "$apk")
-  [ -f "$apk" ] || { err "File tidak ditemukan."; return; }
+  pick_local "$(dl_dir)" file || { warn "Batal."; return; }
+  local apk="$LSEL"
   case "$apk" in *.apk|*.APK) ;; *) err "File bukan .apk."; return ;; esac
   $ADB install -r "$apk"
 }
 
-screenshot() {
-  adb_ready || return
-  local d f
-  d=$(outdir); f="$d/screenshot-$(stamp).png"
-  if $ADB exec-out screencap -p > "$f" 2>/dev/null && [ -s "$f" ]; then
-    ok "Screenshot tersimpan: $f"
-  else
-    rm -f "$f"; err "Gagal mengambil screenshot."
-  fi
+menu_file() {
+  while true; do
+    banner "File & APK"
+    echo " 1) Kirim file ke perangkat (push)"
+    echo " 2) Ambil file dari perangkat (pull)"
+    echo " 3) Install APK"
+    echo " 0) Kembali"
+    echo
+    ask -p "Pilih: " c
+    case "$c" in
+      1) do_push; pause ;;
+      2) do_pull; pause ;;
+      3) do_install_apk; pause ;;
+      0) return ;;
+      *) err "Pilihan tidak valid."; sleep 1 ;;
+    esac
+  done
 }
 
-screenrecord() {
+# ---------- 3. Layar ----------
+do_screenshot() {
+  adb_ready || return
+  local d f; d=$(outdir) || return; f="$d/screenshot-$(stamp).png"
+  if $ADB exec-out screencap -p > "$f" 2>/dev/null && [ -s "$f" ]; then
+    ok "Tersimpan: $f"
+  else rm -f "$f"; err "Gagal ambil screenshot."; fi
+}
+
+do_screenrecord() {
   adb_ready || return
   local s d f
-  read -r -p "Durasi detik [30, maks 180]: " s
-  s=${s:-30}
+  ask -p "Durasi detik [30, maks 180]: " s; s=${s:-30}
   [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 1 ] && [ "$s" -le 180 ] || { err "Durasi tidak valid."; return; }
-  d=$(outdir); f="$d/screenrecord-$(stamp).mp4"
+  d=$(outdir) || return; f="$d/screenrecord-$(stamp).mp4"
   echo "Merekam $s detik..."
   $ADB shell screenrecord --time-limit "$s" /sdcard/af-rec.mp4
   if $ADB pull /sdcard/af-rec.mp4 "$f" >/dev/null 2>&1 && [ -s "$f" ]; then
-    $ADB shell rm /sdcard/af-rec.mp4 >/dev/null 2>&1
-    ok "Rekaman tersimpan: $f"
-  else
-    err "Gagal mengambil rekaman."
-  fi
+    $ADB shell rm -f /sdcard/af-rec.mp4 >/dev/null 2>&1
+    ok "Tersimpan: $f"
+  else err "Gagal ambil rekaman."; fi
 }
 
-menu_file() {
+menu_layar() {
   while true; do
-    header "File & Aplikasi"
-    echo " 1) Salin file (push/pull)"
-    echo " 2) Install APK"
-    echo " 3) Screenshot"
-    echo " 4) Rekam layar"
+    banner "Layar"
+    echo " 1) Screenshot"
+    echo " 2) Rekam layar"
     echo " 0) Kembali"
     echo
-    read -r -p "Pilih: " c; echo
+    ask -p "Pilih: " c
     case "$c" in
-      1) copy_files; pause ;;
-      2) install_apk; pause ;;
-      3) screenshot; pause ;;
-      4) screenrecord; pause ;;
+      1) do_screenshot; pause ;;
+      2) do_screenrecord; pause ;;
       0) return ;;
       *) err "Pilihan tidak valid."; sleep 1 ;;
     esac
   done
 }
 
-# ---------- 3. Reboot ----------
-do_reboot() { # do_reboot <label> <perintah...>
-  local label="$1"; shift
-  confirm "Reboot ke $label?" || { echo "Dibatalkan."; return; }
-  "$@"
-}
-
-reboot_from_adb() {
-  adb_ready || return
-  echo "Reboot via ADB (beberapa mode tergantung perangkat):"
-  echo " 1) System (normal)"
-  echo " 2) Recovery"
-  echo " 3) Bootloader (Fastboot)"
-  echo " 4) FastbootD (userspace)"
-  echo " 5) Sideload"
-  echo " 6) Download mode (Samsung)"
-  echo " 7) EDL (Qualcomm)"
-  echo " 0) Batal"
-  read -r -p "Pilih: " c
-  case "$c" in
-    1) do_reboot "System" $ADB reboot ;;
-    2) do_reboot "Recovery" $ADB reboot recovery ;;
-    3) do_reboot "Bootloader" $ADB reboot bootloader ;;
-    4) do_reboot "FastbootD" $ADB reboot fastboot ;;
-    5) do_reboot "Sideload" $ADB reboot sideload ;;
-    6) do_reboot "Download mode" $ADB reboot download ;;
-    7) do_reboot "EDL" $ADB reboot edl ;;
-    0) ;;
-    *) err "Pilihan tidak valid." ;;
-  esac
-}
-
-reboot_from_fastboot() {
-  need_fb || return
-  if [ -z "$($FB devices 2>&1)" ]; then warn "Tidak ada perangkat Fastboot terdeteksi."; return; fi
-  echo "Reboot via Fastboot:"
-  echo " 1) System (normal)"
-  echo " 2) Bootloader (muat ulang)"
-  echo " 3) Recovery"
-  echo " 4) FastbootD (userspace)"
-  echo " 0) Batal"
-  read -r -p "Pilih: " c
-  case "$c" in
-    1) do_reboot "System" $FB reboot ;;
-    2) do_reboot "Bootloader" $FB reboot bootloader ;;
-    3) do_reboot "Recovery" $FB reboot recovery ;;
-    4) do_reboot "FastbootD" $FB reboot fastboot ;;
-    0) ;;
-    *) err "Pilihan tidak valid." ;;
-  esac
-}
+# ---------- 4. Reboot (adaptif mode) ----------
+do_reboot() { local label="$1"; shift; confirm "Reboot ke $label?" || { echo "Dibatalkan."; return; }; "$@"; sleep 1; }
 
 menu_reboot() {
   while true; do
-    header "Reboot"
-    echo "Perangkat target sedang di mode apa?"
-    echo " 1) System / ADB"
-    echo " 2) Fastboot"
-    echo " 0) Kembali"
-    echo
-    read -r -p "Pilih: " c; echo
-    case "$c" in
-      1) reboot_from_adb; pause ;;
-      2) reboot_from_fastboot; pause ;;
-      0) return ;;
-      *) err "Pilihan tidak valid."; sleep 1 ;;
+    banner "Reboot"
+    case "$MODE" in
+      adb|recovery|sideload)
+        echo " 1) System   2) Recovery   3) Bootloader  4) FastbootD"
+        echo " 5) Sideload 6) Download (Samsung)  7) EDL (Qualcomm)"
+        echo " 0) Kembali"; echo
+        ask -p "Pilih: " c
+        case "$c" in
+          1) do_reboot "System"      $ADB reboot ;;
+          2) do_reboot "Recovery"    $ADB reboot recovery ;;
+          3) do_reboot "Bootloader"  $ADB reboot bootloader ;;
+          4) do_reboot "FastbootD"   $ADB reboot fastboot ;;
+          5) do_reboot "Sideload"    $ADB reboot sideload ;;
+          6) do_reboot "Download"    $ADB reboot download ;;
+          7) do_reboot "EDL"         $ADB reboot edl ;;
+          0) return ;;
+          *) err "Pilihan tidak valid."; sleep 1 ;;
+        esac ;;
+      fastboot)
+        echo " 1) System   2) Bootloader   3) Recovery   4) FastbootD"
+        echo " 0) Kembali"; echo
+        ask -p "Pilih: " c
+        case "$c" in
+          1) do_reboot "System"     $FB reboot ;;
+          2) do_reboot "Bootloader" $FB reboot bootloader ;;
+          3) do_reboot "Recovery"   $FB reboot recovery ;;
+          4) do_reboot "FastbootD"  $FB reboot fastboot ;;
+          0) return ;;
+          *) err "Pilihan tidak valid."; sleep 1 ;;
+        esac ;;
+      *)
+        warn "Tidak ada perangkat aktif."
+        echo " R) Cek ulang   0) Kembali"; echo
+        ask -p "Pilih: " c
+        [ "$c" = 0 ] && return ;;
     esac
   done
 }
 
-# ---------- 4. Koneksi ----------
+# ---------- 5. Koneksi ----------
 diagnose() {
-  echo -e "${BOLD}Diagnosis USB${RESET}"
-  echo
+  echo -e "${BOLD}Diagnosis USB${RESET}"; echo
   local c
   for c in termux-usb termux-adb termux-fastboot adb fastboot; do
-    if command -v "$c" >/dev/null 2>&1; then
-      echo -e "${GREEN}[ada]${RESET}   $c"
-    else
-      echo -e "${RED}[tidak]${RESET} $c"
-    fi
+    if command -v "$c" >/dev/null 2>&1; then echo -e " ${GREEN}✔${RESET} $c"; else echo -e " ${RED}✖${RESET} $c"; fi
   done
   echo
   if command -v termux-usb >/dev/null 2>&1; then
-    echo "Perangkat USB terdeteksi:"
-    local list
-    list=$(termux-usb -l 2>&1)
-    echo "$list"
+    local list; list=$(termux-usb -l 2>&1); echo "$list"
     if [ "$list" = "[]" ] || [ -z "$list" ]; then
-      echo
-      warn "Tidak ada perangkat USB. Cek kabel data, adapter OTG, daya, dan izin USB."
+      echo; warn "Tidak ada perangkat USB. Cek kabel data, OTG, dan cabut-pasang lalu jalankan lagi."
     fi
   else
-    warn "termux-usb tidak ada. Pasang paket termux-api dan aplikasi Termux:API."
+    warn "termux-usb tidak ada. Pasang paket termux-api + aplikasi Termux:API."
   fi
+  echo
+  warn "Catatan: 'adb' biasa (android-tools) TIDAK bisa akses USB tanpa root —"
+  warn "hanya berguna untuk ADB over WiFi. Untuk USB pakai termux-adb."
 }
 
 wifi_pair() {
   need_adb || return
   echo "Di target: Opsi pengembang > Debugging nirkabel > Pasangkan dengan kode."
   local hp code
-  read -r -p "IP:PORT pairing (mis. 192.168.1.5:37123): " hp
+  ask -p "IP:PORT pairing (mis. 192.168.1.5:37123): " hp
   [ -n "$hp" ] || { err "Kosong."; return; }
-  read -r -p "Kode pairing 6 digit: " code
+  ask -p "Kode pairing 6 digit: " code
   [ -n "$code" ] || { err "Kosong."; return; }
-  $ADB pair "$hp" "$code"
+  if $ADB pair "$hp" "$code"; then
+    ok "Pairing sukses. Lanjut connect dengan port dari layar Debugging nirkabel."
+    confirm "Connect sekarang?" && wifi_connect
+  fi
 }
 
-wifi_connect() {
-  need_adb || return
-  local hp
-  read -r -p "IP:PORT koneksi (port di layar Debugging nirkabel): " hp
-  [ -n "$hp" ] || { err "Kosong."; return; }
-  $ADB connect "$hp"
-}
+wifi_connect()   { need_adb || return; local hp; ask -p "IP:PORT koneksi: " hp; [ -n "$hp" ] && $ADB connect "$hp"; }
+wifi_disconnect(){ need_adb || return; $ADB disconnect; }
 
-wifi_disconnect() {
-  need_adb || return
-  $ADB disconnect
+wifi_tcpip() {
+  adb_ready || return
+  local ip
+  ip=$($ADB shell "ip -f inet addr show wlan0" 2>/dev/null | awk '/inet /{split($2,a,"/"); print a[1]; exit}' | tr -d '\r')
+  [ -n "$ip" ] || { err "IP WiFi tidak terbaca (WiFi aktif?)."; return; }
+  confirm "Aktifkan ADB over WiFi di $ip:5555?" || return
+  $ADB tcpip 5555 && sleep 1 && $ADB connect "$ip:5555"
+  warn "Sekarang USB boleh dicabut (perangkat & Termux harus di WiFi yang sama)."
 }
 
 menu_koneksi() {
   while true; do
-    header "Koneksi"
+    banner "Koneksi"
     echo " 1) Diagnosis USB"
     echo " 2) ADB nirkabel: pairing"
     echo " 3) ADB nirkabel: connect"
     echo " 4) ADB nirkabel: disconnect"
+    echo " 5) ADB via WiFi mode lama (tcpip, perlu USB dulu)"
     echo " 0) Kembali"
     echo
-    read -r -p "Pilih: " c; echo
+    ask -p "Pilih: " c
     case "$c" in
       1) diagnose; pause ;;
       2) wifi_pair; pause ;;
       3) wifi_connect; pause ;;
       4) wifi_disconnect; pause ;;
+      5) wifi_tcpip; pause ;;
       0) return ;;
       *) err "Pilihan tidak valid."; sleep 1 ;;
     esac
   done
 }
 
-# ---------- 5. Alat ----------
-save_logcat() {
+# ---------- 6. Alat ----------
+do_logcat() {
   adb_ready || return
-  local d f
-  d=$(outdir); f="$d/logcat-$(stamp).txt"
-  if $ADB logcat -d > "$f" 2>/dev/null && [ -s "$f" ]; then
-    ok "Logcat tersimpan: $f"
-  else
-    rm -f "$f"; err "Gagal menyimpan logcat."
-  fi
+  local d f; d=$(outdir) || return; f="$d/logcat-$(stamp).txt"
+  $ADB logcat -d > "$f" 2>/dev/null && [ -s "$f" ] && ok "Tersimpan: $f" || { rm -f "$f"; err "Gagal simpan logcat."; }
+}
+
+do_crashlog() {
+  adb_ready || return
+  local d f; d=$(outdir) || return; f="$d/crash-$(stamp).txt"
+  $ADB logcat -b crash -d > "$f" 2>/dev/null && [ -s "$f" ] && ok "Tersimpan: $f" || { rm -f "$f"; warn "Buffer crash kosong."; }
+}
+
+do_bugreport() {
+  adb_ready || return
+  local d f; d=$(outdir) || return; f="$d/bugreport-$(stamp).zip"
+  warn "Butuh 1–3 menit, layar target jangan dikunci."
+  $ADB bugreport "$f" && [ -s "$f" ] && ok "Tersimpan: $f" || err "Gagal bugreport."
+}
+
+do_report() {
+  adb_ready || return
+  local d f; d=$(outdir) || return; f="$d/laporan-$(stamp).txt"
+  {
+    echo "=== AF Termux — Laporan Perangkat ==="; date
+    echo "--- getprop ---";   $ADB shell getprop
+    echo "--- battery ---";   $ADB shell dumpsys battery
+    echo "--- display ---";   $ADB shell wm size; $ADB shell wm density
+    echo "--- storage ---";   $ADB shell df -h /data
+    echo "--- meminfo ---";   $ADB shell head -5 /proc/meminfo
+    echo "--- partisi ---";   $ADB shell "ls -l /dev/block/by-name/ 2>/dev/null"
+    echo "--- kernel ---";    $ADB shell uname -a
+  } > "$f" 2>/dev/null
+  [ -s "$f" ] && ok "Tersimpan: $f" || { rm -f "$f"; err "Gagal buat laporan."; }
 }
 
 backup_keys() {
   local src="$HOME/.android"
-  if [ ! -f "$src/adbkey" ]; then
-    warn "Kunci ADB belum ada di $src. Jalankan ADB sekali dulu."
-    return
-  fi
-  local dest="$HOME"
-  [ -d "$HOME/storage/shared" ] && dest="$HOME/storage/shared"
+  [ -f "$src/adbkey" ] || { warn "Kunci ADB belum ada. Jalankan ADB sekali dulu."; return; }
+  local dest="$HOME"; [ -d "$HOME/storage/shared" ] && dest="$HOME/storage/shared"
   local file="$dest/adbkey-backup-$(stamp).tar.gz"
-  if tar -czf "$file" -C "$HOME" .android/adbkey .android/adbkey.pub 2>/dev/null; then
-    chmod 600 "$file" 2>/dev/null
-    ok "Backup tersimpan: $file"
-    warn "Kunci privat ini rahasia, jangan dibagikan."
-  else
-    err "Backup gagal."
-  fi
-  [ "$dest" = "$HOME" ] && echo "Tip: jalankan 'termux-setup-storage' agar backup bisa disimpan di penyimpanan bersama."
-}
-
-adb_shell() {
-  adb_ready || return
-  echo "Shell ADB — ketik 'exit' untuk keluar."
-  $ADB shell
+  tar -czf "$file" -C "$HOME" .android/adbkey .android/adbkey.pub 2>/dev/null \
+    && { chmod 600 "$file" 2>/dev/null; ok "Backup: $file"; warn "Kunci ini RAHASIA, jangan dibagikan."; } \
+    || err "Backup gagal."
 }
 
 menu_alat() {
   while true; do
-    header "Alat"
-    echo " 1) Simpan logcat"
-    echo " 2) Backup kunci ADB"
-    echo " 3) Shell ADB"
+    banner "Alat"
+    echo " 1) Logcat (simpan)      4) Laporan perangkat"
+    echo " 2) Log crash (simpan)   5) Backup kunci ADB"
+    echo " 3) Bugreport (zip)      6) Shell ADB"
     echo " 0) Kembali"
     echo
-    read -r -p "Pilih: " c; echo
+    ask -p "Pilih: " c
     case "$c" in
-      1) save_logcat; pause ;;
-      2) backup_keys; pause ;;
-      3) adb_shell; pause ;;
+      1) do_logcat; pause ;;
+      2) do_crashlog; pause ;;
+      3) do_bugreport; pause ;;
+      4) do_report; pause ;;
+      5) backup_keys; pause ;;
+      6) adb_ready && { echo "Ketik 'exit' untuk keluar."; $ADB shell; }; pause ;;
       0) return ;;
       *) err "Pilihan tidak valid."; sleep 1 ;;
     esac
   done
 }
 
-# ---------- 6. Pengaturan ----------
+# ---------- 7. Advanced (flash — risiko) ----------
+flash_part() { # $1 = nama partisi ("boot"/"recovery"/"dtbo"/"vendor_boot"/"custom")
+  need_fb || return
+  local part="$1"
+  local base img size prod c
+  if [ "$part" = custom ]; then
+    ask -p "Nama partisi (mis. abl, xbl, vbmeta): " part
+    [[ "$part" =~ ^[a-z0-9_]+$ ]] || { err "Nama partisi tidak valid."; return; }
+  fi
+  pick_local "$(dl_dir)" file || { warn "Batal."; return; }
+  img="$LSEL"
+  case "$img" in *.img|*.IMG|*.bin|*.BIN) ;; *) err "Bukan file .img/.bin."; return ;; esac
+  size=$(stat -c%s "$img" 2>/dev/null || echo 0)
+  prod=$($FB getvar product 2>&1 | tr -d '\r' | sed 's/^.*product: *//;s/^\(.*\)$/\1/;q')
+  hr
+  echo -e " Partisi : ${BOLD}${part}${RESET}"
+  echo -e " Image   : $img ($(( size / 1048576 )) MB)"
+  echo -e " Target  : ${prod:-fastboot device}"
+  hr
+  warn "MENULIS PARTISI BISA BOOTLOOP / BRICK."
+  warn "Pastikan image benar-benar untuk perangkat ini. Tidak ada undo."
+  confirm "Lanjut flash '$part'?" || { echo "Dibatalkan."; return; }
+  ask -p "Ketik FLASH untuk konfirmasi terakhir: " c
+  [ "$c" = "FLASH" ] || { echo "Dibatalkan."; return; }
+  if $FB flash "$part" "$img"; then
+    ok "Flash '$part' selesai."
+    confirm "Reboot system sekarang?" && $FB reboot
+  else
+    err "Flash gagal — baca pesan di atas."
+  fi
+}
+
+do_sideload() {
+  need_adb || return
+  pick_local "$(dl_dir)" file || { warn "Batal."; return; }
+  local zip="$LSEL"
+  case "$zip" in *.zip|*.ZIP) ;; *) err "Bukan file .zip (OTA)."; return ;; esac
+  if [ "$MODE" != sideload ]; then
+    warn "Perangkat akan di-reboot ke mode Sideload."
+    confirm "Lanjut?" || return
+    $ADB reboot sideload
+    echo -n "Menunggu mode sideload"
+    wait_mode sideload 60 || { err "Mode sideload tidak terdeteksi (recovery stok? cobakan custom recovery)."; return; }
+    echo
+  fi
+  confirm "Kirim '$zip' via sideload?" || return
+  $ADB sideload "$zip" && ok "Sideload selesai." || err "Sideload gagal."
+}
+
+menu_advanced() {
+  while true; do
+    banner "ADVANCED — Flash & Sideload"
+    warn "Modul ini MENULIS partisi. Salah image = bootloop/brick."
+    warn "Toolkit TIDAK menyediakan erase partisi."
+    echo
+    case "$MODE" in
+      fastboot)
+        echo " 1) Flash boot          4) Flash vendor_boot"
+        echo " 2) Flash recovery      5) Flash partisi lain (custom)"
+        echo " 3) Flash dtbo"
+        echo " 0) Kembali"; echo
+        ask -p "Pilih: " c
+        case "$c" in
+          1) flash_part boot ;;
+          2) flash_part recovery ;;
+          3) flash_part dtbo ;;
+          4) flash_part vendor_boot ;;
+          5) flash_part custom ;;
+          0) return ;;
+          *) err "Pilihan tidak valid."; sleep 1 ;;
+        esac ;;
+      adb|recovery|sideload)
+        echo " 1) Sideload OTA (.zip)"
+        echo " 0) Kembali"; echo
+        ask -p "Pilih: " c
+        case "$c" in
+          1) do_sideload ;;
+          0) return ;;
+          *) err "Pilihan tidak valid."; sleep 1 ;;
+        esac ;;
+      *)
+        warn "Butuh mode Fastboot atau ADB/Sideload."
+        warn "Dari ADB: Reboot > Bootloader. Dari mati: Power+Vol bawah."
+        echo " R) Cek ulang   0) Kembali"; echo
+        ask -p "Pilih: " c
+        [ "$c" = 0 ] && return ;;
+    esac
+  done
+}
+
+# ---------- 8. Pengaturan ----------
 show_help() {
   cat <<'EOF'
 BANTUAN
-- ADB butuh USB debugging aktif dan persetujuan di perangkat target.
-- Fastboot butuh perangkat target di mode bootloader.
-- Gunakan kabel data dan adapter OTG yang mendukung USB host.
-- Android bisa meminta izin USB saat perangkat disambungkan; setujui.
-- Termux dan Termux:API harus dari sumber yang sama (mis. GitHub).
-- Hasil screenshot, rekaman, dan logcat disimpan di folder AF
-  (di penyimpanan bersama jika 'termux-setup-storage' sudah dijalankan).
-- Toolkit ini tidak melakukan flash atau erase partisi.
-- Jika perangkat tidak terdeteksi, coba Koneksi > Diagnosis USB.
+- Status perangkat diperbarui otomatis tiap layar terbuka; menu Perangkat > R untuk paksa.
+- ADB: aktifkan USB debugging + setujui dialog di target (dan izin USB untuk Termux).
+- Fastboot: target harus di mode bootloader.
+- File picker: angka = pilih, 0 = naik folder, k = ketik manual, p = pakai folder.
+- Modul Advanced menulis partisi (flash/sideload): konfirmasi ganda, TANPA erase.
+- Fallback 'adb' (android-tools) hanya untuk ADB over WiFi, bukan USB.
 EOF
 }
 
 show_about() {
-  echo "AF Termux (ADB Fastboot Termux)"
-  echo "Versi   : $AF_VERSION"
-  echo "Oleh    : lptech22"
+  echo "AF Termux v$AF_VERSION — by lptech22"
   echo "Repo    : https://github.com/$AF_REPO"
   echo "Backend : nohajc/termux-adb"
-  echo "ADB     : ${ADB:-tidak ada}"
-  echo "Fastboot: ${FB:-tidak ada}"
+  echo "ADB     : ${ADB:-tidak ada} $([ -n "$ADB" ] && $ADB --version 2>/dev/null | head -1)"
+  echo "Fastboot: ${FB:-tidak ada} $([ -n "$FB" ] && $FB --version 2>/dev/null | head -1)"
 }
 
 do_update() {
-  if ! command -v curl >/dev/null 2>&1; then err "curl tidak ditemukan."; return 1; fi
-  local tmp newv target
-  tmp=$(mktemp) || return 1
+  command -v curl >/dev/null 2>&1 || { err "curl tidak ada."; return 1; }
+  local tmp newv target; tmp=$(mktemp) || return 1
   echo "Mengecek pembaruan..."
-  if ! curl -fsSL "$AF_RAW/af" -o "$tmp"; then
-    err "Gagal mengunduh versi terbaru."; rm -f "$tmp"; return 1
-  fi
-  if ! bash -n "$tmp" 2>/dev/null; then
-    err "File unduhan tidak valid, pembaruan dibatalkan."; rm -f "$tmp"; return 1
-  fi
+  curl -fsSL "$AF_RAW/af" -o "$tmp" || { err "Gagal unduh."; rm -f "$tmp"; return 1; }
+  bash -n "$tmp" 2>/dev/null || { err "File tidak valid."; rm -f "$tmp"; return 1; }
   newv=$(grep -m1 '^AF_VERSION=' "$tmp" | cut -d'"' -f2)
-  if [ -z "$newv" ]; then err "Versi terbaru tidak terbaca."; rm -f "$tmp"; return 1; fi
-  if [ "$newv" = "$AF_VERSION" ]; then
-    ok "Sudah versi terbaru ($AF_VERSION)."; rm -f "$tmp"; return 0
-  fi
+  [ -n "$newv" ] || { err "Versi tak terbaca."; rm -f "$tmp"; return 1; }
+  if [ "$newv" = "$AF_VERSION" ]; then ok "Sudah terbaru ($AF_VERSION)."; rm -f "$tmp"; return 0; fi
   confirm "Perbarui $AF_VERSION -> $newv?" || { echo "Dibatalkan."; rm -f "$tmp"; return 0; }
   target="$PREFIX/bin/af"
-  if cp "$tmp" "$target.new" && chmod +x "$target.new" && mv -f "$target.new" "$target"; then
-    ln -sf af "$PREFIX/bin/adb-fb" 2>/dev/null
-    ok "Berhasil diperbarui ke $newv. Jalankan 'af' lagi."
-  else
-    err "Gagal memasang pembaruan."
-  fi
+  cp "$tmp" "$target.new" && chmod +x "$target.new" && mv -f "$target.new" "$target" \
+    && ln -sf af "$PREFIX/bin/adb-fb" 2>/dev/null \
+    && ok "Terbaru: $newv. Jalankan 'af' lagi." || err "Gagal pasang."
   rm -f "$tmp"
-  return 0
 }
 
 do_uninstall() {
-  echo "Ini menghapus perintah 'af' dan 'adb-fb'."
-  echo "Backend (termux-adb, termux-fastboot) dan kunci ADB tidak dihapus."
-  confirm "Lanjut hapus?" || { echo "Dibatalkan."; return 0; }
+  echo "Menghapus perintah 'af' dan 'adb-fb'."
+  confirm "Lanjut?" || { echo "Dibatalkan."; return 1; }
   rm -f "$PREFIX/bin/af" "$PREFIX/bin/adb-fb"
-  ok "AF Termux dihapus."
+  confirm "Hapus juga backend termux-adb/termux-fastboot?" && \
+    rm -f "$PREFIX/bin/termux-adb" "$PREFIX/bin/termux-fastboot"
+  ok "Selesai."
 }
 
 menu_pengaturan() {
   while true; do
-    header "Pengaturan"
-    echo " 1) Bantuan"
-    echo " 2) Tentang / versi"
-    echo " 3) Perbarui toolkit"
-    echo " 4) Hapus toolkit"
+    banner "Pengaturan"
+    echo " 1) Bantuan        3) Perbarui toolkit"
+    echo " 2) Tentang        4) Hapus toolkit"
     echo " 0) Kembali"
     echo
-    read -r -p "Pilih: " c; echo
+    ask -p "Pilih: " c
     case "$c" in
       1) show_help; pause ;;
       2) show_about; pause ;;
-      3) do_update; if [ "$?" -eq 0 ]; then pause; fi ;;
-      4) do_uninstall; exit 0 ;;
+      3) do_update && pause ;;
+      4) do_uninstall && exit 0 ;;
       0) return ;;
       *) err "Pilihan tidak valid."; sleep 1 ;;
     esac
@@ -505,31 +661,47 @@ menu_pengaturan() {
 case "${1:-}" in
   -v|--version|version) echo "AF Termux $AF_VERSION"; exit 0 ;;
   -h|--help|help)       usage; exit 0 ;;
+  info)                 detect_mode; case "$MODE" in adb|recovery|sideload) info_adb ;; fastboot) info_fastboot ;; *) echo "Tidak ada perangkat." ;; esac; exit 0 ;;
   update)               do_update; exit $? ;;
   uninstall)            do_uninstall; exit $? ;;
   "") ;;
   *) echo "Perintah tidak dikenal: $1"; echo; usage; exit 1 ;;
 esac
 
+usage() {
+  cat <<EOF
+AF Termux v$AF_VERSION — ADB & Fastboot lewat Termux
+  af            menu utama
+  af info       info perangkat cepat
+  af update     perbarui toolkit
+  af uninstall  hapus toolkit
+  af --version / --help
+EOF
+}
+
 # ---------- menu utama ----------
 while true; do
-  header
-  echo " 1) Perangkat        cek ADB/Fastboot, info"
-  echo " 2) File & Aplikasi  salin, APK, screenshot"
-  echo " 3) Reboot           system, recovery, fastboot, dll"
-  echo " 4) Koneksi          USB, ADB nirkabel"
-  echo " 5) Alat             logcat, backup kunci, shell"
-  echo " 6) Pengaturan       bantuan, update, hapus"
+  banner
+  echo " 1) Perangkat     info lengkap, partisi, refresh"
+  echo " 2) File & APK    browser 2 arah, install APK"
+  echo " 3) Layar         screenshot, rekam layar"
+  echo " 4) Reboot        sesuai mode terdeteksi"
+  echo " 5) Koneksi       USB, ADB nirkabel"
+  echo " 6) Alat          logcat, bugreport, laporan"
+  echo " 7) Advanced      flash & sideload ${RED}(risiko)${RESET}"
+  echo " 8) Pengaturan    bantuan, update, hapus"
   echo " 0) Keluar"
   echo
-  read -r -p "Pilih menu: " choice
+  ask -p "Pilih menu: " choice
   case "$choice" in
     1) menu_perangkat ;;
     2) menu_file ;;
-    3) menu_reboot ;;
-    4) menu_koneksi ;;
-    5) menu_alat ;;
-    6) menu_pengaturan ;;
+    3) menu_layar ;;
+    4) menu_reboot ;;
+    5) menu_koneksi ;;
+    6) menu_alat ;;
+    7) menu_advanced ;;
+    8) menu_pengaturan ;;
     0|q|Q) echo "Sampai jumpa."; exit 0 ;;
     *) err "Pilihan tidak valid."; sleep 1 ;;
   esac
